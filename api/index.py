@@ -3,6 +3,7 @@ Vercel Python serverless entry: FastAPI puzzle matcher.
 """
 from __future__ import annotations
 import json
+import logging
 import sys
 import time
 from pathlib import Path
@@ -15,6 +16,45 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from puzzle_match import process_payload
 app = FastAPI(title="Puzzle Match (Vercel)", version="1.0.0")
+
+# Vercel captures standard Python logging in Runtime Logs.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger("puzzle_match.api")
+
+
+@app.middleware("http")
+async def log_http_requests(request: Request, call_next):
+    """Log request lifecycle without recording request bodies or sensitive data."""
+    started = time.perf_counter()
+    request_id = request.headers.get("x-vercel-id") or request.headers.get("x-request-id") or "-"
+    logger.info(
+        "REQUEST_START request_id=%s method=%s path=%s",
+        request_id,
+        request.method,
+        request.url.path,
+    )
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.exception(
+            "REQUEST_ERROR request_id=%s method=%s path=%s",
+            request_id,
+            request.method,
+            request.url.path,
+        )
+        raise
+    logger.info(
+        "REQUEST_DONE request_id=%s method=%s path=%s status=%s duration_ms=%.3f",
+        request_id,
+        request.method,
+        request.url.path,
+        response.status_code,
+        (time.perf_counter() - started) * 1000.0,
+    )
+    return response
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -198,13 +238,18 @@ async def match(request: Request):
         if data is None:
             raise HTTPException(status_code=400, detail="Invalid JSON")
 
+    matcher_started = time.perf_counter()
     try:
         # Keep the original sequential matcher; do not dispatch jobs to workers.
         report = process_payload(data, step_coarse=4, step_fine=2)
     except HTTPException:
+        logger.warning("MATCH_ERROR type=HTTPException")
         raise
     except Exception as e:
+        logger.exception("MATCH_ERROR type=%s", type(e).__name__)
         raise HTTPException(status_code=400, detail=str(e))
+    matcher_ms = (time.perf_counter() - matcher_started) * 1000.0
+    logger.info("MATCH_DONE matcher_ms=%.3f", matcher_ms)
 
     if not isinstance(report, dict):
         raise HTTPException(
