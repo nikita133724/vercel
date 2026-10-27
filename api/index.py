@@ -10,10 +10,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from puzzle_match import process_payload_async
+from puzzle_match import process_payload
 app = FastAPI(title="Puzzle Match (Vercel)", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
@@ -151,15 +151,33 @@ async def index():
 async def health():
     return {"ok": True, "service": "puzzle-match"}
 @app.post("/api/match")
-async def match(file: UploadFile = File(...)):
-    """Accept JSON file (same format as CLI), process, return results + profile."""
+async def match(request: Request):
+    """Accept either a multipart JSON file or a JSON request body; process sequentially."""
     t_start = time.perf_counter()
+    filename = None
+    content_type = request.headers.get("content-type", "").lower()
+
     try:
-        raw = await file.read()
+        if content_type.startswith("multipart/form-data"):
+            form = await request.form()
+            uploaded = form.get("file")
+            if uploaded is None or not hasattr(uploaded, "read"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Multipart request must include a file field named 'file'",
+                )
+            filename = getattr(uploaded, "filename", None)
+            raw = await uploaded.read()
+        else:
+            raw = await request.body()
+
         text = raw.decode("utf-8-sig")
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Cannot read file: {e}")
-    # Parse JSON, including JSON preceded by extra text.
+        raise HTTPException(status_code=400, detail=f"Cannot read request body: {e}")
+
+    # Accept ordinary JSON and JSON embedded after leading diagnostic text.
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
@@ -179,22 +197,22 @@ async def match(file: UploadFile = File(...)):
                 pass
         if data is None:
             raise HTTPException(status_code=400, detail="Invalid JSON")
+
     try:
-        report = await process_payload_async(
-            data,
-            step_coarse=4,
-            step_fine=2,
-        )
+        # Keep the original sequential matcher; do not dispatch jobs to workers.
+        report = process_payload(data, step_coarse=4, step_fine=2)
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
     if not isinstance(report, dict):
         raise HTTPException(
             status_code=500,
             detail="Matcher returned an unexpected response type",
         )
-    report["filename"] = file.filename
+    if filename is not None:
+        report["filename"] = filename
     report["server_wall_from_read_ms"] = round(
         (time.perf_counter() - t_start) * 1000.0,
         3,
