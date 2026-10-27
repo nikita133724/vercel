@@ -7,8 +7,7 @@ Endpoints:
   POST /match/file     — upload JSON file (multipart)
   GET  /health         — health check
 
-Concurrency: up to MAX_WORKERS (default 3) parallel CPU-bound matches
-via ThreadPoolExecutor. Batch items are processed concurrently.
+Concurrency: sequential processing (single CPU mode).
 """
 
 from __future__ import annotations
@@ -18,7 +17,6 @@ import base64
 import json
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Optional, Union
@@ -42,7 +40,7 @@ except ImportError:
 # Config
 # ---------------------------------------------------------------------------
 
-MAX_WORKERS = 3  # parallel puzzle matches (2–3 as requested)
+MAX_WORKERS = 1  # sequential processing for single CPU
 STEP_COARSE = 4
 STEP_FINE = 2
 
@@ -51,8 +49,6 @@ app = FastAPI(
     version="1.1.0",
     description="Match puzzle pieces to background slots. Accepts JSON body or file upload.",
 )
-
-_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
 
 # ---------------------------------------------------------------------------
@@ -337,7 +333,7 @@ def _norm(vals: list[float]) -> list[float]:
 
 
 # ---------------------------------------------------------------------------
-# Core match (original, sync — runs in thread pool)
+# Core match (sync)
 # ---------------------------------------------------------------------------
 
 def match_puzzle(data: dict, step_coarse: int = 4, step_fine: int = 2) -> dict:
@@ -498,7 +494,7 @@ def match_puzzle(data: dict, step_coarse: int = 4, step_fine: int = 2) -> dict:
 
 
 def _process_one_item(idx: int, item: Any, step_coarse: int, step_fine: int) -> dict:
-    """Worker for a single batch item (runs in thread)."""
+    """Worker function for a single batch item (processed sequentially)."""
     if not isinstance(item, dict):
         return {"tag": f"{idx:03d}", "error": "not an object"}
     if item.get("status", "ok") != "ok":
@@ -528,7 +524,7 @@ async def process_payload_async(
     step_fine: int = STEP_FINE,
 ) -> dict:
     """
-    Process single object or batch list concurrently (up to MAX_WORKERS).
+    Process single object or batch list sequentially (one by one on 1 CPU).
     """
     t0 = time.perf_counter()
     if isinstance(data, dict):
@@ -540,19 +536,10 @@ async def process_payload_async(
     else:
         raise ValueError("Root must be object or array")
 
-    loop = asyncio.get_running_loop()
-    tasks = [
-        loop.run_in_executor(
-            _executor,
-            _process_one_item,
-            idx,
-            item,
-            step_coarse,
-            step_fine,
-        )
-        for idx, item in enumerate(items)
-    ]
-    results = await asyncio.gather(*tasks)
+    results = []
+    for idx, item in enumerate(items):
+        res = _process_one_item(idx, item, step_coarse, step_fine)
+        results.append(res)
 
     ok_n = sum(1 for r in results if "error" not in r and not r.get("skipped"))
     skipped = sum(1 for r in results if r.get("skipped"))
@@ -629,11 +616,6 @@ async def match_file(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.on_event("shutdown")
-def shutdown_event():
-    _executor.shutdown(wait=False)
-
-
 # ---------------------------------------------------------------------------
 # CLI (optional: still works as script)
 # ---------------------------------------------------------------------------
@@ -644,6 +626,6 @@ if __name__ == "__main__":
         "puzzle_api:app",
         host="0.0.0.0",
         port=8000,
-        workers=1,  # ThreadPool handles concurrency inside
+        workers=1,
         reload=False,
     )
