@@ -1,29 +1,26 @@
 #!/usr/bin/env python3
 """
-FastAPI service for puzzle captcha matcher.
+Fast puzzle captcha matcher (Pillow + NumPy only) with FastAPI endpoints.
+Processes sequentially on a single CPU core.
 
 Endpoints:
-  POST /match          — JSON body (object or array), same format as file
+  POST /match          — JSON body (object or array)
   POST /match/file     — upload JSON file (multipart)
   GET  /health         — health check
-
-Concurrency: sequential processing (single CPU mode).
 """
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import json
 import re
 import time
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any
 
 from fastapi import Body, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
 
 try:
     from PIL import Image, ImageFilter
@@ -35,24 +32,18 @@ try:
 except ImportError:
     raise ImportError("Need numpy")
 
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
-MAX_WORKERS = 1  # sequential processing for single CPU
-STEP_COARSE = 4
-STEP_FINE = 2
-
 app = FastAPI(
     title="Puzzle Captcha Matcher",
     version="1.1.0",
-    description="Match puzzle pieces to background slots. Accepts JSON body or file upload.",
+    description="Match puzzle pieces to background slots sequentially.",
 )
+
+STEP_COARSE = 4
+STEP_FINE = 2
 
 
 # ---------------------------------------------------------------------------
-# I/O (from original)
+# I/O
 # ---------------------------------------------------------------------------
 
 def load_json_bytes(raw: bytes | str):
@@ -130,7 +121,7 @@ def collect_piece_b64(data: dict) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Masks & shape
+# Masks & shape (spikes / caves)
 # ---------------------------------------------------------------------------
 
 def alpha_mask_from_rgba(rgba: np.ndarray, thr: int = 10) -> np.ndarray:
@@ -177,24 +168,28 @@ def analyze_shape(mask: np.ndarray, body_fill: float = 0.55) -> dict:
     spikes: list[str] = []
     caves: list[str] = []
 
+    # TOP
     top = m[: max(1, by0), bx0 : bx1 + 1]
     if top.size and top.mean() > 0.25:
         spikes.append("TOP")
     elif by0 > body_h * 0.12 and m[0:by0, bx0 : bx1 + 1].mean() < 0.2:
         caves.append("TOP")
 
+    # BOTTOM
     bot = m[min(mh, by1 + 1) :, bx0 : bx1 + 1]
     if bot.size and bot.mean() > 0.25:
         spikes.append("BOTTOM")
     elif (mh - 1 - by1) > body_h * 0.12 and m[by1 + 1 :, bx0 : bx1 + 1].mean() < 0.2:
         caves.append("BOTTOM")
 
+    # LEFT
     left = m[by0 : by1 + 1, : max(1, bx0)]
     if left.size and left.mean() > 0.25:
         spikes.append("LEFT")
     elif bx0 > body_w * 0.12 and m[by0 : by1 + 1, :bx0].mean() < 0.2:
         caves.append("LEFT")
 
+    # RIGHT
     right = m[by0 : by1 + 1, min(mw, bx1 + 1) :]
     if right.size and right.mean() > 0.25:
         spikes.append("RIGHT")
@@ -333,7 +328,7 @@ def _norm(vals: list[float]) -> list[float]:
 
 
 # ---------------------------------------------------------------------------
-# Core match (sync)
+# Core match
 # ---------------------------------------------------------------------------
 
 def match_puzzle(data: dict, step_coarse: int = 4, step_fine: int = 2) -> dict:
@@ -493,39 +488,7 @@ def match_puzzle(data: dict, step_coarse: int = 4, step_fine: int = 2) -> dict:
     }
 
 
-def _process_one_item(idx: int, item: Any, step_coarse: int, step_fine: int) -> dict:
-    """Worker function for a single batch item (processed sequentially)."""
-    if not isinstance(item, dict):
-        return {"tag": f"{idx:03d}", "error": "not an object"}
-    if item.get("status", "ok") != "ok":
-        return {
-            "tag": f"{idx:03d}",
-            "cid": item.get("cid"),
-            "skipped": True,
-            "status": item.get("status"),
-        }
-    if not (item.get("bg") or item.get("background")):
-        return {"tag": f"{idx:03d}", "cid": item.get("cid"), "error": "no bg"}
-    try:
-        r = match_puzzle(item, step_coarse=step_coarse, step_fine=step_fine)
-        r["tag"] = f"{idx:03d}"
-        return r
-    except Exception as exc:
-        return {
-            "tag": f"{idx:03d}",
-            "cid": item.get("cid") if isinstance(item, dict) else None,
-            "error": str(exc),
-        }
-
-
-async def process_payload_async(
-    data: Any,
-    step_coarse: int = STEP_COARSE,
-    step_fine: int = STEP_FINE,
-) -> dict:
-    """
-    Process single object or batch list sequentially (one by one on 1 CPU).
-    """
+def process_payload(data, step_coarse: int = STEP_COARSE, step_fine: int = STEP_FINE) -> dict:
     t0 = time.perf_counter()
     if isinstance(data, dict):
         items = [data]
@@ -537,13 +500,40 @@ async def process_payload_async(
         raise ValueError("Root must be object or array")
 
     results = []
+    skipped = 0
+    total_ms = 0.0
+
     for idx, item in enumerate(items):
-        res = _process_one_item(idx, item, step_coarse, step_fine)
-        results.append(res)
+        if not isinstance(item, dict):
+            results.append({"tag": f"{idx:03d}", "error": "not an object"})
+            skipped += 1
+            continue
+        if item.get("status", "ok") != "ok":
+            results.append({
+                "tag": f"{idx:03d}",
+                "cid": item.get("cid"),
+                "skipped": True,
+                "status": item.get("status"),
+            })
+            skipped += 1
+            continue
+        if not (item.get("bg") or item.get("background")):
+            results.append({"tag": f"{idx:03d}", "cid": item.get("cid"), "error": "no bg"})
+            skipped += 1
+            continue
+        try:
+            r = match_puzzle(item, step_coarse=step_coarse, step_fine=step_fine)
+            r["tag"] = f"{idx:03d}"
+            results.append(r)
+            total_ms += r.get("timing_ms", 0)
+        except Exception as exc:
+            results.append({
+                "tag": f"{idx:03d}",
+                "cid": item.get("cid") if isinstance(item, dict) else None,
+                "error": str(exc),
+            })
 
     ok_n = sum(1 for r in results if "error" not in r and not r.get("skipped"))
-    skipped = sum(1 for r in results if r.get("skipped"))
-    total_ms = sum(r.get("timing_ms", 0) for r in results if "timing_ms" in r)
     wall_ms = (time.perf_counter() - t0) * 1000.0
 
     return {
@@ -554,18 +544,17 @@ async def process_payload_async(
         "total_timing_ms": round(total_ms, 3),
         "avg_timing_ms": round(total_ms / ok_n, 3) if ok_n else None,
         "wall_ms": round(wall_ms, 3),
-        "max_workers": MAX_WORKERS,
         "results": results,
     }
 
 
 # ---------------------------------------------------------------------------
-# FastAPI routes
+# FastAPI Endpoints
 # ---------------------------------------------------------------------------
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "max_workers": MAX_WORKERS}
+    return {"status": "ok", "mode": "sequential"}
 
 
 @app.post("/match")
@@ -574,18 +563,13 @@ async def match_json(
     step_coarse: int = STEP_COARSE,
     step_fine: int = STEP_FINE,
 ):
-    """
-    Accept JSON body in the same format as the original file:
-    - single object: { "bg": "...", "pieces": [...], "cid": "..." }
-    - or batch array: [ {...}, {...}, ... ]
-    """
     if not isinstance(payload, (dict, list)):
         raise HTTPException(
             status_code=400,
-            detail="Body must be a JSON object or array (same format as the input file).",
+            detail="Body must be a JSON object or array.",
         )
     try:
-        report = await process_payload_async(payload, step_coarse=step_coarse, step_fine=step_fine)
+        report = process_payload(payload, step_coarse=step_coarse, step_fine=step_fine)
         return report
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -599,16 +583,13 @@ async def match_file(
     step_coarse: int = STEP_COARSE,
     step_fine: int = STEP_FINE,
 ):
-    """
-    Upload a JSON file (same content as original script expected from disk).
-    """
     try:
         raw = await file.read()
         data = load_json_bytes(raw)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid JSON file: {e}")
     try:
-        report = await process_payload_async(data, step_coarse=step_coarse, step_fine=step_fine)
+        report = process_payload(data, step_coarse=step_coarse, step_fine=step_fine)
         return report
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -616,14 +597,10 @@ async def match_file(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ---------------------------------------------------------------------------
-# CLI (optional: still works as script)
-# ---------------------------------------------------------------------------
-
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
-        "puzzle_api:app",
+        "puzzle_match:app",
         host="0.0.0.0",
         port=8000,
         workers=1,
