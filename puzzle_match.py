@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-Fast puzzle captcha matcher (Pillow + NumPy only) with FastAPI endpoints.
-Processes sequentially on a single CPU core.
+Fast puzzle captcha matcher (Pillow + NumPy only).
 
-Endpoints:
-  POST /match          — JSON body (object or array)
-  POST /match/file     — upload JSON file (multipart)
-  GET  /health         — health check
+Pipeline:
+  1. Decode bg + pieces → numpy arrays
+  2. Shape (spikes / caves) for each piece
+  3. Slot search ONCE: one template, coarse step → fine step
+  4. Shape candidates (same topology / low mask L1 vs template)
+  5. If 1 candidate → done; if ≥2 → seam fit (color + brightness)
+  6. Optional final preview only (no debug contours)
+
+Supports single JSON object or batch array.
 """
 
 from __future__ import annotations
@@ -17,10 +21,6 @@ import re
 import time
 from io import BytesIO
 from pathlib import Path
-from typing import Any
-
-from fastapi import Body, FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
 
 try:
     from PIL import Image, ImageFilter
@@ -32,23 +32,13 @@ try:
 except ImportError:
     raise ImportError("Need numpy")
 
-app = FastAPI(
-    title="Puzzle Captcha Matcher",
-    version="1.1.0",
-    description="Match puzzle pieces to background slots sequentially.",
-)
-
-STEP_COARSE = 4
-STEP_FINE = 2
-
 
 # ---------------------------------------------------------------------------
 # I/O
 # ---------------------------------------------------------------------------
 
-def load_json_bytes(raw: bytes | str):
-    if isinstance(raw, bytes):
-        raw = raw.decode("utf-8-sig")
+def load_json(path: Path):
+    raw = path.read_text(encoding="utf-8-sig")
     try:
         data = json.loads(raw)
         if isinstance(data, (dict, list)):
@@ -208,6 +198,7 @@ def shape_key(shape: dict) -> tuple:
 
 
 def normalized_mask(mask: np.ndarray, size: int = 32) -> np.ndarray:
+    """Downscale mask to size×size float32 for cheap L1 compare."""
     ys, xs = np.where(mask)
     if len(xs) == 0:
         return np.zeros((size, size), dtype=np.float32)
@@ -227,10 +218,11 @@ def mask_l1(a: np.ndarray, b: np.ndarray) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Slot search
+# Slot search: ONE template, coarse → fine
 # ---------------------------------------------------------------------------
 
 def edge_map(gray_u8: np.ndarray) -> np.ndarray:
+    """Simple edge magnitude via PIL FIND_EDGES on L image."""
     im = Image.fromarray(gray_u8, mode="L")
     return np.asarray(im.filter(ImageFilter.FIND_EDGES), dtype=np.float32)
 
@@ -242,6 +234,7 @@ def find_slot(
     step_fine: int = 2,
     top_k: int = 3,
 ) -> tuple[int, int, float]:
+    """Match piece boundary onto bg edges; vectorize X positions per row."""
     ys, xs = boundary_coords(mask)
     if len(xs) == 0:
         return 0, 0, -1.0
@@ -277,7 +270,7 @@ def find_slot(
 
 
 # ---------------------------------------------------------------------------
-# Seam fit
+# Seam fit (among shape candidates only)
 # ---------------------------------------------------------------------------
 
 _OUTWARD = ((-2, 0), (2, 0), (0, -2), (0, 2), (-1, 0), (1, 0), (0, -1), (0, 1))
@@ -290,6 +283,7 @@ def seam_costs(
     slot_x: int,
     slot_y: int,
 ) -> tuple[float, float]:
+    """Returns (seam_mae, bright_mae). Lower = better."""
     ys, xs = boundary_coords(mask)
     if len(xs) == 0:
         return 1e9, 1e9
@@ -332,6 +326,10 @@ def _norm(vals: list[float]) -> list[float]:
 # ---------------------------------------------------------------------------
 
 def match_puzzle(data: dict, step_coarse: int = 4, step_fine: int = 2) -> dict:
+    """
+    Full match for one captcha object.
+    Includes per-stage profile in ms (preview not included in total).
+    """
     profile: dict[str, float] = {}
     t_all = time.perf_counter()
 
@@ -343,6 +341,7 @@ def match_puzzle(data: dict, step_coarse: int = 4, step_fine: int = 2) -> dict:
     piece_encs = collect_piece_b64(data)
     profile["collect_b64_refs"] = (time.perf_counter() - t) * 1000.0
 
+    # --- decode bg ---
     t = time.perf_counter()
     bg_img = load_rgba_b64(bg_enc)
     profile["decode_bg"] = (time.perf_counter() - t) * 1000.0
@@ -356,6 +355,7 @@ def match_puzzle(data: dict, step_coarse: int = 4, step_fine: int = 2) -> dict:
     bg_edges = edge_map(bg_gray)
     profile["bg_edge_map"] = (time.perf_counter() - t) * 1000.0
 
+    # --- decode pieces + masks + shape ---
     pieces_rgba = []
     masks = []
     rgbs = []
@@ -398,6 +398,7 @@ def match_puzzle(data: dict, step_coarse: int = 4, step_fine: int = 2) -> dict:
 
     keys = [shape_key(s) for s in shapes]
 
+    # --- slot search per piece ---
     best_edge = -1.0
     slot_x = slot_y = 0
     template_i = 0
@@ -418,6 +419,7 @@ def match_puzzle(data: dict, step_coarse: int = 4, step_fine: int = 2) -> dict:
     edge_score = best_edge
     dominant_key = keys[template_i]
 
+    # --- candidates ---
     t = time.perf_counter()
     t_norm_arr = norms[template_i]
     l1s = [mask_l1(norms[i], t_norm_arr) for i in range(n)]
@@ -430,6 +432,7 @@ def match_puzzle(data: dict, step_coarse: int = 4, step_fine: int = 2) -> dict:
         candidates = [template_i]
     profile["shape_candidates"] = (time.perf_counter() - t) * 1000.0
 
+    # --- seam ---
     t = time.perf_counter()
     if len(candidates) == 1:
         best = candidates[0]
@@ -488,7 +491,15 @@ def match_puzzle(data: dict, step_coarse: int = 4, step_fine: int = 2) -> dict:
     }
 
 
-def process_payload(data, step_coarse: int = STEP_COARSE, step_fine: int = STEP_FINE) -> dict:
+def strip_private(result: dict) -> dict:
+    return {k: v for k, v in result.items() if not k.startswith("_")}
+
+
+def process_payload(data, step_coarse: int = 4, step_fine: int = 2) -> dict:
+    """
+    Process single object or batch list.
+    Returns report dict with results and wall timing.
+    """
     t0 = time.perf_counter()
     if isinstance(data, dict):
         items = [data]
@@ -546,63 +557,3 @@ def process_payload(data, step_coarse: int = STEP_COARSE, step_fine: int = STEP_
         "wall_ms": round(wall_ms, 3),
         "results": results,
     }
-
-
-# ---------------------------------------------------------------------------
-# FastAPI Endpoints
-# ---------------------------------------------------------------------------
-
-@app.get("/health")
-async def health():
-    return {"status": "ok", "mode": "sequential"}
-
-
-@app.post("/match")
-async def match_json(
-    payload: Any = Body(...),
-    step_coarse: int = STEP_COARSE,
-    step_fine: int = STEP_FINE,
-):
-    if not isinstance(payload, (dict, list)):
-        raise HTTPException(
-            status_code=400,
-            detail="Body must be a JSON object or array.",
-        )
-    try:
-        report = process_payload(payload, step_coarse=step_coarse, step_fine=step_fine)
-        return report
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/match/file")
-async def match_file(
-    file: UploadFile = File(...),
-    step_coarse: int = STEP_COARSE,
-    step_fine: int = STEP_FINE,
-):
-    try:
-        raw = await file.read()
-        data = load_json_bytes(raw)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid JSON file: {e}")
-    try:
-        report = process_payload(data, step_coarse=step_coarse, step_fine=step_fine)
-        return report
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(
-        "puzzle_match:app",
-        host="0.0.0.0",
-        port=8000,
-        workers=1,
-        reload=False,
-    )
