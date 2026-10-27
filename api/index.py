@@ -2,32 +2,25 @@
 Vercel Python serverless entry: FastAPI puzzle matcher.
 """
 from __future__ import annotations
-
 import json
 import sys
 import time
 from pathlib import Path
-
 # Ensure project root is on path (puzzle_match.py sits next to api/)
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-
-from puzzle_match import process_payload, load_json
-
+from puzzle_match import process_payload_async
 app = FastAPI(title="Puzzle Match (Vercel)", version="1.0.0")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 INDEX_HTML = """<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -103,7 +96,6 @@ INDEX_HTML = """<!DOCTYPE html>
     const out = document.getElementById('out');
     const meta = document.getElementById('meta');
     const fname = document.getElementById('fname');
-
     file.addEventListener('change', () => {
       go.disabled = !file.files.length;
       fname.textContent = file.files.length ? file.files[0].name : 'Выбери JSON-файл';
@@ -112,7 +104,6 @@ INDEX_HTML = """<!DOCTYPE html>
       out.style.display = 'none';
       meta.style.display = 'none';
     });
-
     document.getElementById('f').addEventListener('submit', async (e) => {
       e.preventDefault();
       if (!file.files.length) return;
@@ -121,10 +112,8 @@ INDEX_HTML = """<!DOCTYPE html>
       status.className = '';
       out.style.display = 'none';
       meta.style.display = 'none';
-
       const fd = new FormData();
       fd.append('file', file.files[0]);
-
       const t0 = performance.now();
       try {
         const res = await fetch('/api/match', { method: 'POST', body: fd });
@@ -155,18 +144,12 @@ INDEX_HTML = """<!DOCTYPE html>
 </body>
 </html>
 """
-
-
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return INDEX_HTML
-
-
 @app.get("/api/health")
 async def health():
     return {"ok": True, "service": "puzzle-match"}
-
-
 @app.post("/api/match")
 async def match(file: UploadFile = File(...)):
     """Accept JSON file (same format as CLI), process, return results + profile."""
@@ -176,36 +159,46 @@ async def match(file: UploadFile = File(...)):
         text = raw.decode("utf-8-sig")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Cannot read file: {e}")
-
-    # Parse JSON (robust, same as load_json logic)
+    # Parse JSON, including JSON preceded by extra text.
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
         decoder = json.JSONDecoder()
-        start_arr, start_obj = text.find("["), text.find("{")
+        start_arr = text.find("[")
+        start_obj = text.find("{")
         data = None
         if start_arr >= 0 and (start_obj < 0 or start_arr < start_obj):
             try:
                 data, _ = decoder.raw_decode(text, start_arr)
-            except Exception:
+            except (json.JSONDecodeError, ValueError):
                 pass
         if data is None and start_obj >= 0:
             try:
                 data, _ = decoder.raw_decode(text, start_obj)
-            except Exception:
+            except (json.JSONDecodeError, ValueError):
                 pass
         if data is None:
             raise HTTPException(status_code=400, detail="Invalid JSON")
-
     try:
-        report = process_payload(data, step_coarse=4, step_fine=2)
+        report = await process_payload_async(
+            data,
+            step_coarse=4,
+            step_fine=2,
+        )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-
+    if not isinstance(report, dict):
+        raise HTTPException(
+            status_code=500,
+            detail="Matcher returned an unexpected response type",
+        )
     report["filename"] = file.filename
-    report["server_wall_from_read_ms"] = round((time.perf_counter() - t_start) * 1000.0, 3)
+    report["server_wall_from_read_ms"] = round(
+        (time.perf_counter() - t_start) * 1000.0,
+        3,
+    )
     return JSONResponse(report)
-
-
-# Vercel Python runtime expects a module-level handler for ASGI
+# Vercel Python runtime expects a module-level ASGI application.
 handler = app
